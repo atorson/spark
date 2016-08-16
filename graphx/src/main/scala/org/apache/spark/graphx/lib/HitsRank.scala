@@ -74,7 +74,6 @@ object HitsRank extends Logging {
    * @see [[http://www.math.cornell.edu/~mec/Winter2009/RalucaRemus/Lecture4/lecture4.html]]
    * @see [[https://en.wikipedia.org/wiki/Exponentiation_by_squaring]]
    * @param graph         the graph for which to compute the HITS ranks
-   * @param initValue     initial value of HITS ranks to start iterating from (default is emptyRDD)
    * @param numIter       number of iterations of the main algorithm routine (default is 1)
    * @param convTolerance convergence tolerance(approximate Mean-Squared-Error, default is 0.0)
    * @tparam VD type of the graph vertex attribute object
@@ -83,12 +82,14 @@ object HitsRank extends Logging {
    */
   def run[VD: ClassTag, ED: ClassTag](
       graph: Graph[VD, ED],
-      initValue: RDD[(VertexId, (Double, Double))] = SparkContext.getOrCreate().emptyRDD,
       numIter: Int = 1,
       convTolerance: Double = 0.0): Graph[(Double, Double), ED] = {
 
-      runWithExtendedSignature(graph, initValue, IterationsNumber(numIter),
-        ConvergenceMeasure(convTolerance), FixedNormalizationBatchSize(0))._1
+      runWithExtendedSignature(graph,
+        SparkContext.getOrCreate().emptyRDD,
+        IterationsNumber(numIter),
+        ConvergenceMeasure(convTolerance),
+        FixedNormalizationBatchSize(0))._1
   }
 
   /**
@@ -228,7 +229,7 @@ object HitsRank extends Logging {
         convergence = mseProxy <= convTolerance
         // un-persist the old full iteration values and cache the new reference
         // it will be used for MSE calculations
-        lastFullIterationHits.unpersist(false)
+        unpersist(lastFullIterationHits)
         lastFullIterationHits = hitsGraph.vertices
         // log lazily
         logDebug("Mean-Square-Difference at HITS algorithm iteration #"
@@ -248,7 +249,7 @@ object HitsRank extends Logging {
     }
 
     // final cache cleanup
-    // note: the HITS vertices are intentionally left persisted since they likely be consumed
+    // note: the HITS vertices are intentionally left persisted since they are likely to be consumed
     if (!areEdgesPersistent) unpersist(hitsGraph.edges)
     if (!lastFullIterationHits.eq(hitsGraph.vertices)) unpersist(lastFullIterationHits)
 
@@ -359,7 +360,6 @@ object HitsRank extends Logging {
    * @param reductionFactor defines reduction factor on top of maximum batch size (must be >= 1)
    */
   case class ElasticNormalizationBatchSize(reductionFactor: Int) extends NormalizationBatchSize
-
 
 }
 
