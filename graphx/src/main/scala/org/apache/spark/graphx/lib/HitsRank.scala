@@ -23,6 +23,7 @@ import org.apache.spark.SparkContext
 import org.apache.spark.graphx._
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
 
 
 /**
@@ -86,110 +87,188 @@ object HitsRank extends Logging {
       numIter: Int = 1,
       convTolerance: Double = 0.0): Graph[(Double, Double), ED] = {
 
-    runWithExtraReturnInfo(graph, initValue, numIter, convTolerance)._1
+      runWithExtendedSignature(graph, initValue, IterationsNumber(numIter),
+        ConvergenceMeasure(convTolerance), FixedNormalizationBatchSize(0))._1
   }
 
   /**
-   * Extended output version of the run() method
+   * Extended signature version of the run() method
+   * Requires all input parameters to be provided explicitly
    * In addition, returns a value object describing how HITS algorithm performed.
-   * The value object is a map of [[org.apache.spark.graphx.lib.HitsAlgorithmMetric]]
+   * Some parameter inputs are cases of [[org.apache.spark.graphx.lib.HitsRank.AlgorithmMetric]]
+   * The value object is a map of [[org.apache.spark.graphx.lib.HitsRank.AlgorithmMetric]]
    * keyed by the metric case Class(indicates metric uniqueness within the map,
    * enforced within this run() method)
    *
-   * @param graph         the graph for which to compute the HITS ranks
-   * @param initValue     initial value of HITS ranks to start iterating from (default is emptyRDD)
-   * @param numIter       number of iterations of the main algorithm routine (default is 1)
-   * @param convTolerance convergence tolerance(approximate Mean-Squared-Error, default is 0.0)
+   * @param graph the graph for which to compute the HITS ranks
+   * @param initValue initial value of HITS ranks to start iterating from
+   * @param iterationsNumber number of iterations of the main algorithm routine
+   * @param convergenceTolerance convergence tolerance(approximate Mean-Squared-Error)
+   * @param normalizationBatchSize batch size of HITS iterations without HITS ranks normalization
    * @tparam VD type of the graph vertex attribute object
    * @tparam ED type of the graph edge attribute object
    * @return HITS graph and value object with algorithm performance details
    */
-  private [lib] def runWithExtraReturnInfo[VD: ClassTag, ED: ClassTag](
+  private [lib] def runWithExtendedSignature[VD: ClassTag, ED: ClassTag](
       graph: Graph[VD, ED],
-      initValue: RDD[(VertexId, (Double, Double))] = SparkContext.getOrCreate().emptyRDD,
-      numIter: Int = 1,
-      convTolerance: Double = 0.0): (Graph[(Double, Double), ED],
-                                     Map[Class[_ <: HitsAlgorithmMetric], HitsAlgorithmMetric]) = {
+      initValue: RDD[(VertexId, (Double, Double))],
+      iterationsNumber: IterationsNumber,
+      convergenceTolerance: ConvergenceMeasure,
+      normalizationBatchSize: NormalizationBatchSize) : (Graph[(Double, Double), ED],
+                                            Map[Class[_ <: AlgorithmMetric], AlgorithmMetric]) = {
+    val numIter: Int = iterationsNumber.iterNum
+    val convTolerance: Double = convergenceTolerance.tolerance
 
     require(numIter > 0, s"Number of iterations must be greater than 0," +
       s" but got ($numIter)")
+
+    require(convTolerance >= 0.0, s"Convergence tolerance must be greater than or equal to 0.0," +
+      s" but got ($convTolerance)")
+
+    normalizationBatchSize match {
+      case FixedNormalizationBatchSize(n) => require(n >= 0,
+        s"Fixed un-normalized iterations batch size must be non-negative, but got ($n)")
+      case ElasticNormalizationBatchSize(n) => require(n >= 1,
+        s"Elastic un-normalized iterations batch size reduction factor must be greater than 0," +
+        s" but got ($n)")
+    }
 
     // the condition below guarantees that there will never be
     // a situation with zero norm of the ranks collection
     require(!graph.edges.isEmpty(), "Collection of edges in the input graph must be non-empty")
 
-    val useConvergence: Boolean = convTolerance > 0.0
+    // indicates a convergence-checking iteration mode
+    val userRequestedConvergenceMode: Boolean = convTolerance > 0.0
+
+    // init extra output
+    var extraAlgOutput = Map[Class[_ <: AlgorithmMetric], AlgorithmMetric]()
+
+    // We want to normalize ranks every n-th iteration and infer a reasonable value of n
+    // The main concern is overflowing the Double.Max value
+    // the HITS PCA math shows that the norm of the un-normalized ranks grows exponentially
+    // where the base of the exponent is equal to the principal eigen value
+    // which is approximated here by the max over graph.degree
+    val normIterBatchSize: Int = normalizationBatchSize match {
+      case FixedNormalizationBatchSize(n) => n + 1
+      case ElasticNormalizationBatchSize(n) =>
+        math.floor (math.log (Double.MaxValue) / (n * math.log (
+            graph.degrees.max () (DegreeOrdering)._2)) ).toInt
+      case _ => 1
+    }
+
+    // return batch size with the output
+    extraAlgOutput += (classOf[FixedNormalizationBatchSize] -> FixedNormalizationBatchSize(
+      math.max(0, normIterBatchSize-1)))
 
     // Initialize the HITS graph vertex with initial values
     var hitsGraph: Graph[(Double, Double), ED] = graph.
       outerJoinVertices(initValue)(
       (id, oldVal, initHitsVal) => initHitsVal.getOrElse((1.0, 1.0)))
 
+    // remember if the edges and vertices in the original graphs are persistent
+    val areEdgesPersistent: Boolean = graph.edges.getStorageLevel != StorageLevel.NONE
+
     // materialize initial HITS values
-    hitsGraph.vertices.foreachPartition(x => {})
+    materializeAndCache(hitsGraph.edges)
+    // the lastFullIterationHits reference is only used for
+    // MSE calculations in convergence-checking iteration mode
+    var lastFullIterationHits: VertexRDD[(Double, Double)] = materializeAndCache(hitsGraph.vertices)
 
     var convergence = false
-    var extraAlgOutput = Map[Class[_ <: HitsAlgorithmMetric], HitsAlgorithmMetric]()
 
     // Perform a fixed number of iterations
     for (i <- 0 until numIter if !convergence) {
       // need to store reference for cache clean up at the end
-      val prev = hitsGraph
+      val prevHits: VertexRDD[(Double, Double)] = hitsGraph.vertices
+
+      // need an indicator defining if the iteration will include normalization and error evaluation
+      val fullIteration: Boolean = (i + 1) % normIterBatchSize == 0 || (i + 1) == numIter
+
+      // indicates that convergence should be checked at this iteration
+      val checkConvergence: Boolean = userRequestedConvergenceMode && fullIteration
 
       // compute new Authority rank by aggregation of the latest Hub ranks of the incoming neighbors
       // note: the authRanks will not contain nodes with zero in-degree
-      val authRanks: VertexRDD[Double] = hitsGraph.aggregateMessages[Double](
-        ctx => ctx.sendToDst(ctx.srcAttr._1), _ + _, TripletFields.Src).cache()
+      // materialize and cache the ranks
+      val authRanks: VertexRDD[Double] = materializeAndCache(hitsGraph.aggregateMessages(
+        ctx => ctx.sendToDst(ctx.srcAttr._1), _ + _, TripletFields.Src))
 
 
       // merge the Authority rank into the overall HITS rank graph
       // the missing zero in-degree nodes are set with 0.0 auth rank
       // such nodes do not affect and are not needed for the preceding normalization calculation
       hitsGraph = hitsGraph.outerJoinVertices(
-        normalizeRanksUsingL2Norm(authRanks))(
+        if (fullIteration) normalizeRanksUsingL2Norm(authRanks) else authRanks)(
         (id, oldHitsVal, newAuthVal) => (oldHitsVal._1, newAuthVal.getOrElse(0.0)))
 
 
       // compute new Hub rank by aggregation of the latest Authority ranks of the outgoing neighbors
       // note: the hubRanks will not contain nodes with zero out-degree
-      val hubRanks = hitsGraph.aggregateMessages[Double](
-        ctx => ctx.sendToSrc(ctx.dstAttr._2), _ + _, TripletFields.Dst).cache()
+      // materialize and cache the ranks
+      val hubRanks: VertexRDD[Double] = materializeAndCache(hitsGraph.aggregateMessages[Double](
+        ctx => ctx.sendToSrc(ctx.dstAttr._2), _ + _, TripletFields.Dst))
 
 
       // merge the Hub rank into the overall HITS rank graph
       // the missing zero out-degree nodes are set with 0.0 hub rank
       // such nodes do not affect and are not needed for the preceding normalization calculation
       hitsGraph = hitsGraph.outerJoinVertices(
-        normalizeRanksUsingL2Norm(hubRanks))(
+        if (fullIteration) normalizeRanksUsingL2Norm(hubRanks) else hubRanks)(
         (id, oldHitsVal, newHubVal) => (newHubVal.getOrElse(0.0), oldHitsVal._2))
 
-      hitsGraph.vertices.cache()
 
-      // materialize the new HITS vertex values: allows to clean up after each iteration
-      hitsGraph.vertices.foreachPartition(x => {})
+      // materialize and cache the new HITS vertex values: allows to clean up after each iteration
+      materializeAndCache(hitsGraph.vertices)
 
       // lazy MSE error definition
-      lazy val mseProxy = computeHitsMSEProxy(
-        prev.vertices, hitsGraph.vertices)
+      lazy val mseProxy = computeHitsMSEProxy(lastFullIterationHits, hitsGraph.vertices)
 
-      convergence = useConvergence && (mseProxy <= convTolerance)
+      if (checkConvergence) {
+        // check convergence
+        convergence = mseProxy <= convTolerance
+        // un-persist the old full iteration values and cache the new reference
+        // it will be used for MSE calculations
+        lastFullIterationHits.unpersist(false)
+        lastFullIterationHits = hitsGraph.vertices
+        // log lazily
+        logDebug("Mean-Square-Difference at HITS algorithm iteration #"
+          + (i + 1) + " : " + mseProxy)
+        // provide MSE measure with the output in convergence-mode
+        extraAlgOutput += (classOf[ConvergenceMeasure] -> ConvergenceMeasure(mseProxy))
+      }
 
-      // log lazily
-      logDebug("Mean-Square-Difference at HITS algorithm iteration #" + (i + 1) + " : " + mseProxy)
+      // clean up iteration cache
+      unpersist(authRanks)
+      unpersist(hubRanks)
+      if (userRequestedConvergenceMode && lastFullIterationHits.eq(prevHits)) {}
+        else {unpersist(prevHits)}
 
-      // clean up cache
-      authRanks.unpersist(false)
-      hubRanks.unpersist(false)
-      prev.unpersist(false)
-
-      // just put the algIterationsNumber so far: it is cheap to provide
-      extraAlgOutput += (classOf[HitsIterations] -> HitsIterations(i + 1))
+      // provide the actual iterations number with the output
+      extraAlgOutput += (classOf[IterationsNumber] -> IterationsNumber(i + 1))
     }
 
-    // return final HITS rank with extra alg output
+    // final cache cleanup
+    // note: the HITS vertices are intentionally left persisted since they likely be consumed
+    if (!areEdgesPersistent) unpersist(hitsGraph.edges)
+    if (!lastFullIterationHits.eq(hitsGraph.vertices)) unpersist(lastFullIterationHits)
 
+    // return final HITS rank with extra alg output
     (hitsGraph, extraAlgOutput)
 
+  }
+
+  // just a utility function to materialize and cache vertex RDD
+  private def materializeAndCache[B <:RDD[_]](rdd: B): B = {
+    val storageLevel = if (rdd.getStorageLevel != StorageLevel.NONE) {
+      rdd.getStorageLevel }
+    else { StorageLevel.MEMORY_ONLY }
+    rdd.persist(storageLevel).foreachPartition(x => {})
+    rdd
+  }
+
+  // just a utility function to materialize and cache vertex RDD
+  private def unpersist[B <:RDD[_]](rdd: B): Unit = {
+    rdd.unpersist(false)
   }
 
   /**
@@ -233,21 +312,54 @@ object HitsRank extends Logging {
 
   }
 
+  /**
+   * Need this ordering for computing the max graph degree
+   * used in optimizing HITS rank normalization frequency
+   */
+   private val DegreeOrdering = new Ordering[(VertexId, Int)] {
+      override def compare (x: (VertexId, Int), y: (VertexId, Int) ): Int = {
+        x._2.compare(y._2)
+      }
+   }
+
+  /**
+   * Defines a case-class family of HITS algorithm performance metrics
+   * @usecase runWithExtendedSignature()
+   */
+  sealed trait AlgorithmMetric
+
+  /**
+   * Number of HITS algorithm iterations
+   * @param iterNum number of iterations
+   */
+  case class IterationsNumber(iterNum: Int) extends AlgorithmMetric
+
+  /**
+   * Convergence tolerance
+   * @param tolerance tolerance(as measured by approximate mean-squared error)
+   */
+  case class ConvergenceMeasure(tolerance: Double) extends AlgorithmMetric
+
+
+  /**
+   * Defines a case-class family of the HITS normalization steps frequency
+   */
+  sealed trait NormalizationBatchSize extends AlgorithmMetric
+
+  /**
+   * Fixed size of batch of un-normalized iterations in between the HITS normalization steps
+   * @param batchSize must be >=0, with zero indicating normalization at every iteration
+   */
+  case class FixedNormalizationBatchSize(batchSize: Int) extends NormalizationBatchSize
+
+
+  /**
+   * Elastic size of batch of un-normalized iterations in between the HITS normalization steps
+   * Allows the maximum possible batch size to be computed elastically based on the input graph size
+   * @param reductionFactor defines reduction factor on top of maximum batch size (must be >= 1)
+   */
+  case class ElasticNormalizationBatchSize(reductionFactor: Int) extends NormalizationBatchSize
+
+
 }
-
-
-/**
- * Defines a case-class family of HITS algorithm performance metrics
- *
- * @usecase runWithExtraInfo()
- */
-abstract class HitsAlgorithmMetric
-
-
-/**
- * Actual number of HITS algorithm iterations taken
- * @param iterNum number of iterations
- */
-case class HitsIterations(iterNum: Int) extends HitsAlgorithmMetric
-
 

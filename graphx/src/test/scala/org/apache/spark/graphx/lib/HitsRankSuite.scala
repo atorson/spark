@@ -21,7 +21,7 @@ import scala.reflect.ClassTag
 
 import org.scalactic.{Equality, TolerantNumerics}
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkContext, SparkFunSuite}
 import org.apache.spark.graphx._
 
 
@@ -125,7 +125,8 @@ class HitsRankSuite extends SparkFunSuite with LocalSparkContext {
    * @param expectedRanks expected HITS ranks
    * @param numIter       number of iterations
    * @param tolerance     numeric double precision tolerance
-   * @param algAssert    function implementing extra (independent) asserts on algorithm performance
+   * @param batchSize     normalization batch size option
+   * @param algAssert     function implementing extra (independent) asserts on algorithm performance
    * @tparam VD vertex property type
    * @tparam ED edge property type
    * @return HITS results
@@ -133,9 +134,10 @@ class HitsRankSuite extends SparkFunSuite with LocalSparkContext {
   def runHitsTestAndPerformBasicAsserts[VD: ClassTag, ED: ClassTag](
       graph: Graph[VD, ED],
       expectedRanks: Seq[Hits],
-      numIter: Int,
-      tolerance: Double,
-      algAssert: HitsAlgorithmMetric => Boolean = _ => true): Seq[Hits] = {
+      numIter: Int = 1,
+      tolerance: Double = 0.0,
+      batchSize: HitsRank.NormalizationBatchSize = HitsRank.FixedNormalizationBatchSize(0),
+      algAssert: HitsRank.AlgorithmMetric => Boolean = _ => true): Seq[Hits] = {
 
     implicit val hitsEq: Equality[Array[Hits]] = tolerantHitsRankCollectionEquality(
       math.max(0.0000001, tolerance))
@@ -145,10 +147,12 @@ class HitsRankSuite extends SparkFunSuite with LocalSparkContext {
     val expectedAuth: Hits = expectedRanks.find(
       x => x._2._2 > 0.0).getOrElse[Hits]((0L, (0.0, 0.0)))
 
-    val resultsExtra = HitsRank.runWithExtraReturnInfo(
+    val resultsExtra = HitsRank.runWithExtendedSignature(
       graph,
-      numIter = numIter,
-      convTolerance = 0.99 * tolerance)
+      SparkContext.getOrCreate().emptyRDD,
+      HitsRank.IterationsNumber(numIter),
+      HitsRank.ConvergenceMeasure(0.99 * tolerance),
+      batchSize)
 
     val results = resultsExtra._1.vertices.collect()
     val extra = resultsExtra._2
@@ -186,7 +190,7 @@ class HitsRankSuite extends SparkFunSuite with LocalSparkContext {
       val expectedRanks: Seq[Hits] = Seq(
         (1L, (1.0, 1.0)), (2L, (1.0, 1.0)))
 
-      runHitsTestAndPerformBasicAsserts(graph, expectedRanks, 1, 0.0)
+      runHitsTestAndPerformBasicAsserts(graph, expectedRanks)
 
     }
   }
@@ -203,7 +207,7 @@ class HitsRankSuite extends SparkFunSuite with LocalSparkContext {
       val expectedRanks: Seq[Hits] = Seq(
         (1L, (1.0, 0.0)), (2L, (0.0, 1.0)))
 
-      runHitsTestAndPerformBasicAsserts(graph, expectedRanks, 1, 0.0)
+      runHitsTestAndPerformBasicAsserts(graph, expectedRanks)
 
     }
   }
@@ -219,7 +223,7 @@ class HitsRankSuite extends SparkFunSuite with LocalSparkContext {
       val expectedRanks: Seq[Hits] = Seq(
         (1L, (1.0, 0.0)), (2L, (0.0, 1.0 / 2.0)), (3L, (0.0, 1.0 / 2.0)))
 
-      runHitsTestAndPerformBasicAsserts(graph, expectedRanks, 1, 0.0)
+      runHitsTestAndPerformBasicAsserts(graph, expectedRanks)
 
     }
   }
@@ -235,7 +239,7 @@ class HitsRankSuite extends SparkFunSuite with LocalSparkContext {
       val expectedRanks: Seq[Hits] = Seq(
         (1L, (1.0 / 2.0, 0.0)), (2L, (1.0 / 2.0, 0.0)), (3L, (0.0, 1.0)))
 
-      runHitsTestAndPerformBasicAsserts(graph, expectedRanks, 1, 0.0)
+      runHitsTestAndPerformBasicAsserts(graph, expectedRanks)
 
     }
   }
@@ -254,13 +258,47 @@ class HitsRankSuite extends SparkFunSuite with LocalSparkContext {
         (1L, (0.0, 0.0)), (2L, (0.0, 0.0)),
         (3L, (1.0, 0.0)), (4L, (0.0, 1.0 / 2.0)), (5L, (0.0, 1.0 / 2.0)))
 
-      def iterCheck: HitsAlgorithmMetric => Boolean = {
-          case HitsIterations(v) => v < 10
-          case _ => true
+      def algCheck: HitsRank.AlgorithmMetric => Boolean = {
+        case HitsRank.IterationsNumber(v) => v < 10 // expect fewer iterations
+        case HitsRank.ConvergenceMeasure(v) => v < 0.01 // expect better conv metric
+        // expect zero batch size
+        case HitsRank.FixedNormalizationBatchSize(v) => v == 0
+        case _ => true
       }
 
       // will assert that actually fewer iterations were performed to achieve convergence
-      runHitsTestAndPerformBasicAsserts(graph, expectedRanks, 10, 0.01, iterCheck)
+      runHitsTestAndPerformBasicAsserts(graph, expectedRanks,
+        numIter = 10, tolerance = 0.01, algAssert = algCheck)
+
+    }
+  }
+
+  test("HITS Rank: asymmetric 1-Hub-N-Auth tree case") {
+
+    withSpark { sc =>
+      // large simple tree with 1 hub and N children authorities
+      // tests if the smart normalization logic works
+      val n: Int = 8
+      val N: Int = math.pow(2, n).toInt
+      var edges: Seq[(Long, Long)] = Seq[(Long, Long)]()
+      var expectedRanks: Seq[Hits] = Seq[Hits]((1L, (1.0, 0.0)))
+      for (i <- 0 until N) {
+        edges = edges:+ (1L, 2L + i.toLong)
+        // expect equal auth ranks
+        expectedRanks = expectedRanks:+ (2L + i.toLong, (0.0, 1.0))
+      }
+      val graph = Graph.fromEdgeTuples[Int](sc.parallelize[(VertexId, VertexId)](edges), 1)
+
+      def algCheck: HitsRank.AlgorithmMetric => Boolean = {
+        case HitsRank.IterationsNumber(v) => v < 70 // expect fewer iterations
+        case HitsRank.ConvergenceMeasure(v) => v < 0.001 // expect better conv metric
+        // expect smaller batch size
+        case HitsRank.FixedNormalizationBatchSize(v) => v <= math.floor(1024/(4 * n)).toInt
+        case _ => true
+      }
+
+      runHitsTestAndPerformBasicAsserts(graph, expectedRanks, numIter = 70, tolerance = 0.001,
+        batchSize = HitsRank.ElasticNormalizationBatchSize(4))
 
     }
   }
