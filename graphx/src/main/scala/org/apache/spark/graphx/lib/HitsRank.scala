@@ -46,13 +46,13 @@ object HitsRank extends Logging {
    * <LI> Update vertex Authority rank based on Hub ranks of the vertex incoming neighbors
    * <LI> Update vertex Hub rank based on Authority ranks of the vertex outgoing neighbors
    * </OL>
-   * Each update phase normalizes the computed ranks
-   * as is required for the algorithm convergence. L,,2,, norm is used in this implementation:
+   * Some iterations (by default, every) also normalize the computed ranks at both update phases:
+   * this is required for the algorithm convergence. L,,2,, norm is used in this implementation:
    * the norm choice affects convergence rate but not the result (up to a scale)
    * <P>
    * The HITS algorithm is highly similar to the Power-Method
    * used for iterative approximate computation of
-   * the dominant eigen-vector(as in Principal Component Analysis).
+   * the dominant eigen-vector(as in the Principal Component Analysis).
    * Specifically, the HITS should converge to:
    * <OL>
    * <LI> Hub rank: principal unit eigen-vector of the matrix '''AA^T^'''
@@ -65,9 +65,6 @@ object HitsRank extends Logging {
    * This technique requires caching of the powers of matrix '''A'''
    * which is likely to be memory- and/or
    * communication-cost prohibitive for large graphs.
-   * This HITS algorithm implementation is lean on caching
-   * (only caches the previous and the current iteration's (Hub, Authority)
-   * ranks and only for the duration of the iteration)
    * The Repeated Squaring technique is not used in this implementation
    * <P>
    *
@@ -93,19 +90,23 @@ object HitsRank extends Logging {
   }
 
   /**
-   * Extended signature version of the run() method
-   * Requires all input parameters to be provided explicitly
+   * Extended signature version of the run() method.
+   * Requires all input parameters to be provided explicitly.
    * In addition, returns a value object describing how HITS algorithm performed.
-   * Some parameter inputs are cases of [[org.apache.spark.graphx.lib.HitsRank.AlgorithmMetric]]
-   * The value object is a map of [[org.apache.spark.graphx.lib.HitsRank.AlgorithmMetric]]
+   * All non-graph parametric inputs are cases of
+   * [[org.apache.spark.graphx.lib.HitsRank.AlgorithmMetric]]
+   * The output value object is a map of [[org.apache.spark.graphx.lib.HitsRank.AlgorithmMetric]]
    * keyed by the metric case Class(indicates metric uniqueness within the map,
-   * enforced within this run() method)
-   *
+   * enforced within this method)
+   * <P>
+   * Callers of this method may create customized versions of the HITS algorithm
+   * by calling it iteratively (with iterationsNumber set small, say, equal to 1)
+   * and explicitly controlling inputs and outputs at each call
    * @param graph the graph for which to compute the HITS ranks
    * @param initValue initial value of HITS ranks to start iterating from
    * @param iterationsNumber number of iterations of the main algorithm routine
    * @param convergenceTolerance convergence tolerance(approximate Mean-Squared-Error)
-   * @param normalizationBatchSize batch size of HITS iterations without HITS ranks normalization
+   * @param normalizationBatchSize batch size of HITS iterations performed without normalization
    * @tparam VD type of the graph vertex attribute object
    * @tparam ED type of the graph edge attribute object
    * @return HITS graph and value object with algorithm performance details
@@ -274,7 +275,7 @@ object HitsRank extends Logging {
 
   /**
    * Computes the L2 norm of the difference between
-   * previous and last HITS iteration rank values
+   * previous and current HITS iteration rank values
    * This is a good convergence indicator, a proxy for MSE error
    * Expensive to compute - so should be used lazily
    *
@@ -282,7 +283,7 @@ object HitsRank extends Logging {
    * @param next current HITS ranks
    * @return single floating value of the L2 norm of the difference
    */
-  def computeHitsMSEProxy(
+  private[lib] def computeHitsMSEProxy(
       prev: VertexRDD[(Double, Double)],
       next: VertexRDD[(Double, Double)]): Double = {
 
@@ -325,7 +326,6 @@ object HitsRank extends Logging {
 
   /**
    * Defines a case-class family of HITS algorithm performance metrics
-   * @usecase runWithExtendedSignature()
    */
   sealed trait AlgorithmMetric
 
@@ -343,7 +343,7 @@ object HitsRank extends Logging {
 
 
   /**
-   * Defines a case-class family of the HITS normalization steps frequency
+   * Defines a case-class family of the HITS rank normalization strategy and frequency
    */
   sealed trait NormalizationBatchSize extends AlgorithmMetric
 
@@ -357,7 +357,8 @@ object HitsRank extends Logging {
   /**
    * Elastic size of batch of un-normalized iterations in between the HITS normalization steps
    * Allows the maximum possible batch size to be computed elastically based on the input graph size
-   * @param reductionFactor defines reduction factor on top of maximum batch size (must be >= 1)
+   * The graph max-degrees heuristic is used to determine the max possible batch size
+   * @param reductionFactor reduction factor applied to the maximum batch size (must be >= 1)
    */
   case class ElasticNormalizationBatchSize(reductionFactor: Int) extends NormalizationBatchSize
 
